@@ -1,93 +1,98 @@
-"""
-PA 10: Channels -- starter (final PA of the semester).
+"""A bounded FIFO channel for USILang heap handles."""
 
-Complete Channel below, plus the producer/consumer driver at the
-bottom. See the assignment, Part B, for the full requirements.
-Values passed through the channel are GCHeap handles (ints) -- see
-gc_heap.py.
-"""
-
+from collections import deque
 import threading
-from typing import Any, Optional
 
 from gc_heap import GCHeap
 
-_CLOSED_SENTINEL = object()
-
 
 class Channel:
-    def __init__(self, capacity: int, heap: GCHeap) -> None:
-        # TODO: internal buffer (a deque or list works), a threading.Condition,
-        # and a "closed" flag.
-        raise NotImplementedError
+    CLOSED = object()
 
-    def put(self, value: Any) -> None:
-        """
-        Block while the buffer is full. `value` is expected to be a
-        GCHeap handle -- incref it (the channel now holds a reference)
-        BEFORE enqueuing. Wake a waiting get() once space is available.
-        """
-        # TODO
-        raise NotImplementedError
+    def __init__(self, capacity: int, heap: GCHeap) -> None:
+        if capacity <= 0:
+            raise ValueError("Channel capacity must be positive")
+        self._capacity = capacity
+        self._heap = heap
+        self._buffer = deque()
+        self._closed = False
+        lock = threading.Lock()
+        self._not_empty = threading.Condition(lock)
+        self._not_full = threading.Condition(lock)
+
+    def put(self, value: int) -> None:
+        with self._not_full:
+            while len(self._buffer) == self._capacity and not self._closed:
+                self._not_full.wait()
+            if self._closed:
+                raise RuntimeError("Cannot put into a closed channel")
+
+            self._heap.incref(value)
+            self._buffer.append(value)
+            self._not_empty.notify()
 
     def get(self):
-        """
-        Block while the buffer is empty (and not closed). Returns the
-        next value, transferring the channel's reference to the
-        caller (do NOT decref here -- the caller now owns that
-        reference and is responsible for eventually releasing it).
-        On an empty, closed channel, return the sentinel from
-        `Channel.CLOSED` instead of blocking forever.
-        """
-        # TODO
-        raise NotImplementedError
+        with self._not_empty:
+            while not self._buffer and not self._closed:
+                self._not_empty.wait()
+            if not self._buffer:
+                return self.CLOSED
+
+            handle = self._buffer.popleft()
+            self._not_full.notify()
+            return handle
 
     def close(self) -> None:
-        """Mark closed and wake every blocked thread."""
-        # TODO
-        raise NotImplementedError
+        with self._not_empty:
+            self._closed = True
+            self._not_empty.notify_all()
+            self._not_full.notify_all()
 
-    CLOSED = _CLOSED_SENTINEL
 
+def producer_consumer_driver(
+    heap: GCHeap, values: list, channel: Channel, num_consumers: int = 1
+):
+    """Return the (handle, value) pairs processed by the consumers."""
+    if num_consumers < 1:
+        raise ValueError("At least one consumer is required")
 
-def producer_consumer_driver(heap: GCHeap, values: list, channel: Channel, num_consumers: int = 1):
-    """
-    Given: a driver you can use as-is (or adapt) for your own testing.
-    One producer thread allocates + puts each value in `values` onto
-    `channel`, then closes it. `num_consumers` consumer threads pull
-    handles off, look up and record their value, then release their
-    transferred reference, exiting cleanly on the CLOSED sentinel.
-    Returns the list of delivered (handle, value) pairs.
-    """
     delivered = []
     delivered_lock = threading.Lock()
+    heap_lock = threading.Lock()
 
     def produce():
-        for v in values:
-            handle = heap.allocate(v)
-            try:
-                channel.put(handle)
-            finally:
-                heap.decref(handle)  # release the creator reference
-        channel.close()
+        try:
+            for value in values:
+                with heap_lock:
+                    handle = heap.allocate(value)
+                try:
+                    channel.put(handle)
+                finally:
+                    with heap_lock:
+                        heap.decref(handle)
+        finally:
+            channel.close()
 
     def consume():
         while True:
             handle = channel.get()
             if handle is Channel.CLOSED:
                 return
-            value = heap._objects[handle][0]  # PA 9 stores [object, refcount]
-            with delivered_lock:
-                delivered.append((handle, value))
-            heap.decref(handle)  # the consumer is done with its transferred reference
+            try:
+                with heap_lock:
+                    value = heap._objects[handle]
+                with delivered_lock:
+                    delivered.append((handle, value))
+            finally:
+                with heap_lock:
+                    heap.decref(handle)
 
-    producer_thread = threading.Thread(target=produce)
-    consumer_threads = [threading.Thread(target=consume) for _ in range(num_consumers)]
-    for t in [producer_thread] + consumer_threads:
-        t.start()
-    producer_thread.join()
-    for t in consumer_threads:
-        t.join(timeout=10.0)
-
+    producer = threading.Thread(target=produce)
+    consumers = [threading.Thread(target=consume) for _ in range(num_consumers)]
+    for consumer in consumers:
+        consumer.start()
+    producer.start()
+    producer.join()
+    for consumer in consumers:
+        consumer.join()
     return delivered
-
